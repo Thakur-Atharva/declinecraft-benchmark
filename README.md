@@ -113,3 +113,8 @@ python 8_metrics.py --dir results
   query vectors slightly, so the top-5 chunks can differ for a few percent of queries. Compare conditions using
   runs made in the same batch.
 - Wiki text is from minecraft.wiki (CC BY-NC-SA 3.0); the corpora are rebuilt by `1_scrape.py`, not shipped.
+
+## License
+
+The code is released under the MIT License (see `LICENSE`). Data derived from minecraft.wiki (corpora, questions
+and reference answers) is licensed CC BY-NC-SA, following the wiki's license.
