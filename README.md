@@ -35,7 +35,14 @@ pip install -r requirements.txt
 ```
 
 Every model is called through an OpenAI-compatible endpoint, so any server works (vLLM, llama.cpp's
-`llama-server`, OpenRouter). Set the endpoints in the environment or in a `.env` file next to the scripts:
+`llama-server`, OpenRouter). Copy the template and fill in your own endpoints and keys:
+
+```bash
+cp .env.example .env      # then edit .env; it is git-ignored
+```
+
+The scripts read `.env` from this folder; variables already set in the environment take precedence. The main
+settings are:
 
 | Variable | Used for | Paper setting |
 |---|---|---|
@@ -111,10 +118,8 @@ python 8_metrics.py --dir results
 ## Reproducibility notes
 
 - Two runs of the same configuration are not identical even at temperature 0. Batched GPU inference is not
-  bit-reproducible, and closed APIs are not deterministic. The embedding server's batched mode also perturbs
-  query vectors slightly, so the top-5 chunks can differ for a few percent of queries. Compare conditions using
-  runs made in the same batch.
-- Wiki text is from minecraft.wiki (CC BY-NC-SA 3.0); the corpora are rebuilt by `1_scrape.py`, not shipped.
+  bit-reproducible, and closed APIs are not deterministic.
+- Wiki text is from minecraft.wiki (CC BY-NC-SA 3.0).
 
 ## Citation
 
