@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use DeclineCraft, please cite the paper below."
+title: "DeclineCraft: code"
+authors:
+  - family-names: "Thakur"
+    given-names: "Atharva"
+  - family-names: "Saparov"
+    given-names: "Abulhair"
+  - family-names: "Ribeiro"
+    given-names: "Bruno"
+repository-code: "https://github.com/Thakur-Atharva/declinecraft-benchmark"
+license: MIT
+preferred-citation:
+  type: generic
+  title: "DeclineCraft: A RAG Abstention Benchmark for Jointly Measuring Combined Retrieval and Parametric Knowledge"
+  authors:
+    - family-names: "Thakur"
+      given-names: "Atharva"
+    - family-names: "Saparov"
+      given-names: "Abulhair"
+    - family-names: "Ribeiro"
+      given-names: "Bruno"
+  year: 2026
+  url: "https://arxiv.org/abs/2610.28340"
+  identifiers:
+    - type: other
+      value: "arXiv:2610.28340"
+      description: "arXiv identifier"

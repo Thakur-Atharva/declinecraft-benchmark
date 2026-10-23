@@ -1,7 +1,9 @@
 # DeclineCraft: code
 
-Code to rebuild the DeclineCraft benchmark and to evaluate a model on it. The scripts are numbered in pipeline
-order; each one resumes if rerun.
+Code to rebuild the DeclineCraft benchmark and to evaluate a model on it, accompanying the paper
+[DeclineCraft: A RAG Abstention Benchmark for Jointly Measuring Combined Retrieval and Parametric Knowledge](https://arxiv.org/abs/2610.28340).
+If you use the code or data, please [cite the paper](#citation). The scripts are numbered in pipeline order; each
+one resumes if rerun.
 
 | Step | Script | What it does |
 |---|---|---|
@@ -113,6 +115,22 @@ python 8_metrics.py --dir results
   query vectors slightly, so the top-5 chunks can differ for a few percent of queries. Compare conditions using
   runs made in the same batch.
 - Wiki text is from minecraft.wiki (CC BY-NC-SA 3.0); the corpora are rebuilt by `1_scrape.py`, not shipped.
+
+## Citation
+
+If you find DeclineCraft useful in your research, please cite:
+
+```bibtex
+@misc{thakur2026declinecraft,
+      title={{DeclineCraft}: A {RAG} Abstention Benchmark for Jointly Measuring Combined Retrieval and Parametric Knowledge},
+      author={Atharva Thakur and Abulhair Saparov and Bruno Ribeiro},
+      year={2026},
+      eprint={2610.28340},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2610.28340},
+}
+```
 
 ## License
 
