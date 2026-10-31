@@ -4,17 +4,28 @@
 ===========
 Builds the two corpora from minecraft.wiki through the MediaWiki API.
 
-  C_pre   breadth-first crawl from seed pages (and, optionally, gameplay categories); for every page, the newest
-          revision at or before the cutoff (31 March 2025). Version/changelog pages, mob-vote proposals,
-          redirects and pages under 200 characters are skipped.
-  C_post  crawl from titles naming post-cutoff content; a page is kept only if its FIRST revision is after the
-          cutoff (pages that existed before and were later updated are excluded); stored at its latest revision.
-  filter  drops pages that are not real, current base-game mechanics (joke/April Fools, version, story and
-          spin-off, media and merchandise, creator docs, non-article pages), by title and category.
+  list    the complete page list: every current article of the main and Tutorial namespaces with its current
+          categories, and every redirect last edited after the cutoff (it may have been an article then).
+  pre     C_pre: every listed page at its newest revision at or before the cutoff (31 March 2025). Version and
+          changelog pages, mob-vote proposals, redirects and pages under 200 characters are skipped.
+  post    C_post: every listed article whose FIRST revision is after the cutoff (pages that existed before and were
+          later updated are excluded), at its latest revision.
+  filter  drops pages that are not real, current base-game mechanics: joke/April Fools, version, story and spin-off,
+          media and merchandise, creator docs, non-article pages, structure blueprints, soundtrack tracks, maps,
+          franchise and novel pages, protocol and dated pages (both corpora); set-index pages, planned features and
+          tutorials (C_post only: post-cutoff tutorials are guides to old mechanics).
 
-    python 1_scrape.py pre  --max-pages 4000 --seed-categories
-    python 1_scrape.py post --max-pages 300
+Every API failure raises and is retried on the next pass, never read as "no revision" or "no categories": under the
+wiki's rate limiting, a throttled request otherwise drops real pages (Drowned, Phantom, Name Tag, ...). Each stage
+resumes if rerun, and exits non-zero while pages are still failing.
+
+    python 1_scrape.py list
+    python 1_scrape.py pre
+    python 1_scrape.py post
     python 1_scrape.py filter
+
+The paper's v13 corpora were built by link-following crawls with page caps, which missed about 900 articles that
+existed at the cutoff; they are kept as `crawl-pre` and `crawl-post`.
 """
 import argparse
 import json
@@ -22,7 +33,9 @@ import os
 import random
 import re
 import shutil
+import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -659,6 +672,249 @@ def scrape_wiki_post_cutoff(
               f"(redirects and sub-{MIN_CONTENT_CHARS}-char stubs crawled for links but not indexed)")
 
 
+# --- Full page-list crawl (default) ------------------------------------------------------------------------
+
+
+TUTORIAL_NS = 10010
+PAGE_LIST_FILE = os.path.join(os.path.dirname(TRAIN_JSON_FILE) or ".", "page_list.json")
+CUTOFF_ISO = TARGET_DATE.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+class WikiAPIError(RuntimeError):
+    """An API request failed after its retries. Never to be read as an empty answer."""
+
+
+def _api(params: dict) -> dict:
+    d = _api_get({**params, 'format': 'json'}, timeout=30, max_attempts=10)
+    if d is None:
+        raise WikiAPIError(f"API failed: {params}")
+    return d
+
+
+def _key(title: str) -> str:
+    return title.replace(' ', '_')
+
+
+def _save_json(obj: Any, path: str) -> None:
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(obj, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _all_pages(ns: int, redirects: bool) -> List[str]:
+    out, cont = [], {}
+    while True:
+        d = _api({'action': 'query', 'list': 'allpages', 'apnamespace': ns, 'aplimit': 500,
+                  'apfilterredir': 'redirects' if redirects else 'nonredirects', **cont})
+        out += [p['title'] for p in d['query']['allpages']]
+        if 'continue' not in d:
+            return out
+        cont = d['continue']
+
+
+def _query_titles(titles: List[str], params: dict) -> Dict[str, Dict[str, Any]]:
+    """prop queries for titles, 50 per request, following continuation: {title: page}."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for i in range(0, len(titles), 50):
+        cont = {}
+        while True:
+            d = _api({'action': 'query', 'titles': '|'.join(titles[i:i + 50]), **params, **cont})
+            for p in d.get('query', {}).get('pages', {}).values():
+                cur = out.setdefault(p['title'], {'categories': [], 'revisions': []})
+                cur['categories'] += [c['title'].split(':', 1)[1].replace(' ', '_') for c in p.get('categories', [])]
+                cur['revisions'] += p.get('revisions', [])
+            if 'continue' not in d:
+                break
+            cont = d['continue']
+    return out
+
+
+def list_pages(path: Optional[str] = None) -> None:
+    """The complete page list, with each article's current categories (used by the filter)."""
+    path = path or PAGE_LIST_FILE
+    articles, late_redirects = {}, []
+    for ns in (0, TUTORIAL_NS):
+        titles = _all_pages(ns, redirects=False)
+        cats = _query_titles(titles, {'prop': 'categories', 'cllimit': 'max'})
+        missing = [t for t in titles if t not in cats]
+        if missing:
+            raise WikiAPIError(f"no category answer for {len(missing)} pages, e.g. {missing[:3]}")
+        articles.update({t: cats[t]['categories'] for t in titles})
+        redirects = [t for t in _all_pages(ns, redirects=True) if not title_reason(_key(t))]
+        revs = _query_titles(redirects, {'prop': 'revisions', 'rvprop': 'timestamp'})
+        late_redirects += [t for t, p in revs.items() if p['revisions'] and p['revisions'][0]['timestamp'] > CUTOFF_ISO]
+        print(f"namespace {ns}: {len(titles)} articles, {len(redirects)} redirects", flush=True)
+    _save_json({'cutoff': CUTOFF_ISO, 'listed_at': datetime.now().isoformat(), 'articles': articles,
+                'redirects_after_cutoff': sorted(late_redirects)}, path)
+    print(f"{len(articles)} articles and {len(late_redirects)} redirects edited after the cutoff -> {path}")
+
+
+def _load_page_list(path: Optional[str] = None) -> Dict[str, Any]:
+    path = path or PAGE_LIST_FILE
+    if not os.path.exists(path):
+        raise SystemExit(f"{path} is missing: run `1_scrape.py list` first")
+    return json.load(open(path, encoding='utf-8'))
+
+
+def cutoff_revision(title: str) -> Optional[Tuple[str, datetime]]:
+    """(oldid, timestamp) of the newest revision at or before the cutoff, None if the page has none. Raises on API
+    failure (get_latest_revision_before_date reads any failure as None)."""
+    d = _api({'action': 'query', 'prop': 'revisions', 'titles': title.replace('_', ' '), 'rvlimit': 1,
+              'rvstart': CUTOFF_ISO, 'rvdir': 'older', 'rvprop': 'ids|timestamp'})
+    for pid, p in d.get('query', {}).get('pages', {}).items():
+        if pid == '-1' or 'missing' in p:
+            return None
+        revs = p.get('revisions') or []
+        if revs:
+            return str(revs[0]['revid']), datetime.strptime(revs[0]['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
+    return None
+
+
+def first_revision(title: str) -> Optional[str]:
+    """Timestamp of a page's first revision (page moves keep their history), None if it has none. Raises on API
+    failure (check_oldest_revision reads a failure as "not after the cutoff")."""
+    d = _api({'action': 'query', 'prop': 'revisions', 'titles': title.replace('_', ' '), 'rvlimit': 1,
+              'rvdir': 'newer', 'rvprop': 'timestamp'})
+    for pid, p in d.get('query', {}).get('pages', {}).items():
+        revs = p.get('revisions') or []
+        return None if pid == '-1' or not revs else revs[0]['timestamp']
+    return None
+
+
+def fetch_pre_page(title: str) -> Dict[str, Any]:
+    """C_pre record of one page, or {'skipped': reason}. Raises on API failure."""
+    rev = cutoff_revision(title)
+    if rev is None:
+        return {'skipped': 'no revision at or before the cutoff'}
+    oldid, revision_date = rev
+    url = f"{BASE_URL}/w/{_key(title)}"
+    wikitext = scrape_revision_content(None, url, oldid)
+    if wikitext is None:
+        raise WikiAPIError(f"content fetch failed for {title} ({oldid})")
+    if is_redirect(wikitext):
+        return {'skipped': 'redirect'}
+    clean = wikitext_to_paragraphs(wikitext)
+    if not clean or len(clean.strip()) < MIN_CONTENT_CHARS:
+        return {'skipped': 'too_short'}
+    if VOTE_PROPOSAL_RE.search(clean[:1500]):
+        return {'skipped': 'vote_proposal'}
+    return {'url': url, 'oldid': oldid, 'date': revision_date.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'scraped_at': datetime.now().isoformat(), 'content': clean, 'links': []}
+
+
+def fetch_post_page(title: str, earliest: str) -> Optional[Dict[str, Any]]:
+    """C_post record of one page at its latest revision, or None for a redirect or stub. Raises on API failure."""
+    info = get_latest_revision_info(title.replace('_', ' '))
+    if not info:
+        raise WikiAPIError(f"no latest revision for {title}")
+    oldid, ts = info
+    url = f"{BASE_URL}/w/{_key(title)}"
+    wikitext = scrape_revision_content(None, url, oldid)
+    if wikitext is None:
+        raise WikiAPIError(f"content fetch failed for {title} ({oldid})")
+    if is_redirect(wikitext):
+        return None
+    clean = wikitext_to_paragraphs(wikitext)
+    if not clean or len(clean.strip()) < MIN_CONTENT_CHARS:
+        return None
+    return {'url': url, 'oldid': oldid, 'date': ts, 'earliest_date': earliest,
+            'scraped_at': datetime.now().isoformat(), 'content': clean, 'links': []}
+
+
+def _run_passes(todo: List[str], fetch, record, workers: int, passes: int, label: str) -> List[str]:
+    """Calls fetch on every title, retrying failed ones in later passes; record(title, result) stores a result.
+    Returns the titles still failing."""
+    for n in range(1, passes + 1):
+        failed = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(fetch, t): t for t in todo}
+            for i, fut in enumerate(as_completed(futures), 1):
+                t = futures[fut]
+                try:
+                    record(t, fut.result())
+                except WikiAPIError:
+                    failed.append(t)
+                if i % 500 == 0:
+                    print(f"  [{label} pass {n}] {i}/{len(todo)}, {len(failed)} failed", flush=True)
+        print(f"[{label}] pass {n}: {len(todo) - len(failed)} done, {len(failed)} failed", flush=True)
+        if not failed:
+            return []
+        todo = sorted(failed)
+        time.sleep(30 * n)
+    return todo
+
+
+def scrape_pre_full(output_path: str = TRAIN_JSON_FILE, workers: int = 8, passes: int = 4) -> List[str]:
+    """C_pre from the page list: every article and every redirect edited after the cutoff, at the cutoff."""
+    plist = _load_page_list()
+    cands = sorted({_key(t) for t in list(plist['articles']) + plist['redirects_after_cutoff']
+                    if not title_reason(_key(t))})
+    data = json.load(open(output_path, encoding='utf-8')) if os.path.exists(output_path) else {}
+    skip_path = _skip_path(output_path)
+    skipped = json.load(open(skip_path, encoding='utf-8')) if os.path.exists(skip_path) else {}
+    if not isinstance(skipped, dict):
+        skipped = {}
+    todo = [t for t in cands if t not in data and t not in skipped]
+    print(f"C_pre: {len(cands)} listed pages, {len(data)} stored, {len(skipped)} skipped, {len(todo)} to fetch")
+    lock = threading.Lock()
+
+    def record(t, rec):
+        with lock:
+            if rec.get('skipped'):
+                skipped[t] = rec['skipped']
+            else:
+                data[t] = rec
+            if (len(data) + len(skipped)) % 500 == 0:
+                _save_json(data, output_path)
+                _save_json(skipped, skip_path)
+
+    failing = _run_passes(todo, fetch_pre_page, record, workers, passes, 'C_pre')
+    _save_json(data, output_path)
+    _save_json(skipped, skip_path)
+    print(f"C_pre: {len(data)} pages -> {output_path}; skipped {dict(Counter(skipped.values()))}")
+    return failing
+
+
+def scrape_post_full(output_path: str = TEST_JSON_FILE, workers: int = 8, passes: int = 4) -> List[str]:
+    """C_post from the page list: every main-namespace article whose first revision is after the cutoff. Titles the
+    filter would reject by title or current category are not fetched."""
+    plist = _load_page_list()
+    cands = sorted(t for t, cats in plist['articles'].items()
+                   if not t.startswith('Tutorial:') and is_candidate_article(t)
+                   and not classify((_key(t), {'categories': cats}), False)[1])
+    first_path = f"{output_path}.first_revisions.json"
+    first = json.load(open(first_path, encoding='utf-8')) if os.path.exists(first_path) else {}
+    lock = threading.Lock()
+
+    def record_first(t, ts):
+        with lock:
+            first[t] = ts
+
+    failing = _run_passes([t for t in cands if t not in first], first_revision, record_first, workers, passes,
+                          'first revisions')
+    _save_json(first, first_path)
+    target = datetime.strptime(CUTOFF_ISO, '%Y-%m-%dT%H:%M:%SZ')
+    post = sorted(t for t in cands if first.get(t) and datetime.strptime(first[t], '%Y-%m-%dT%H:%M:%SZ') >= target)
+    data = json.load(open(output_path, encoding='utf-8')) if os.path.exists(output_path) else {}
+    stubs = set(json.load(open(_skip_path(output_path)))) if os.path.exists(_skip_path(output_path)) else set()
+    todo = [t for t in post if _key(t) not in data and _key(t) not in stubs]
+    print(f"C_post: {len(post)} of {len(cands)} articles created after the cutoff; {len(todo)} to fetch")
+
+    def record(t, rec):
+        with lock:
+            if rec is None:
+                stubs.add(_key(t))
+            else:
+                data[_key(t)] = rec
+
+    failing += _run_passes(todo, lambda t: fetch_post_page(t, first[t]), record, workers, passes, 'C_post')
+    _save_json(data, output_path)
+    _save_json(sorted(stubs), _skip_path(output_path))
+    print(f"C_post: {len(data)} pages -> {output_path} ({len(stubs)} redirects or stubs skipped)")
+    return failing
+
+
 # --- Filtering: pages that are not real, current base-game mechanics -------------------------------
 
 
@@ -812,84 +1068,202 @@ def classify(item: Tuple[str, Dict[str, Any]], fetch_categories: bool) -> Tuple[
     return title, "", (cats or [])
 
 
-def filter_corpus(path: str, label: str, dry_run: bool, workers: int) -> List[str]:
-    """Filters one corpus JSON; returns the titles it dropped (or would drop)."""
-    if not os.path.exists(path):
+# Rules added for the 2026 rebuild (first author, 23 Oct 2026). The lists above predate many pages created since
+# (Heelys, Batman (world), ...) and were tuned on a capped crawl that rarely reached sub-pages.
+EXTRA_TITLE_RULES = {
+    "structure blueprints": re.compile(r"/Blueprints(/|$)"),            # /Structure overviews stay
+    "Character Creator cosmetics": re.compile(r"^Character_Creator(/|$)"),
+    "dated / version-line pages": re.compile(r"^\d{8}$|^\d+\.x$"),
+    "sound / outdated-loot / store sub-pages": re.compile(r"/Sounds$|/Outdated_loot_tables|_store_pages$"),
+    "protocol / release-timeline / API pages": re.compile(r"Protocol_version_numbers|release_timeline|_API(/|$)"),
+}
+EXTRA_CATEGORY_RULES = {
+    "disambiguation pages": lambda c: "Disambiguation_pages" in c,
+    "soundtrack tracks": lambda c: any("Original_Game_Soundtrack" in x for x in c) and "Music_discs" not in c,
+    "maps and collaborations": lambda c: bool({"Maps", "Collaborative_maps", "Other_franchises"} & c),
+    "franchise and merchandise": lambda c: "Minecraft_(franchise)" in c,
+    "novels and book settings": lambda c: any(x.endswith("_novels") for x in c) or bool({"Schools", "Earth_locations"} & c),
+}
+# C_post only. Set-index pages (Plant, Metal, ...) carry facts in C_pre. Tutorials created after the cutoff are guides
+# to old mechanics (TNT cannons, minecart trains, the deep dark): 65 of the first 100 unanswerable drafts targeted
+# them with pre-cutoff facts ("Tamed wolves can be brought into mineshafts").
+POST_ONLY_TITLE_RULES = {"tutorials (guides to old mechanics)": re.compile(r"^Tutorial:")}
+POST_ONLY_CATEGORY_RULES = {
+    "set-index pages": lambda c: "Set_index_pages" in c,
+    "planned, unreleased features": lambda c: "Planned" in c,
+}
+EXTRA_KEEP_TITLES = {"Minecraft"}
+DISAMBIGUATION_MAX_CHARS = 1500
+
+
+def extra_reason(title: str, categories: List[str], post: bool) -> str:
+    """The 2026 rules: a rejection reason, or '' to keep."""
+    if title in EXTRA_KEEP_TITLES:
+        return ""
+    for name, rx in list(EXTRA_TITLE_RULES.items()) + (list(POST_ONLY_TITLE_RULES.items()) if post else []):
+        if rx.search(title):
+            return name
+    c = set(categories or [])
+    for name, f in list(EXTRA_CATEGORY_RULES.items()) + (list(POST_ONLY_CATEGORY_RULES.items()) if post else []):
+        if f(c):
+            return name
+    return ""
+
+
+def page_reason(title: str, record: Dict[str, Any], current: List[str], cutoff: Optional[List[str]]) -> str:
+    """Why a page is dropped ('' to keep). C_post pages (cutoff None) are judged on their current categories, which
+    are those of the stored revision. C_pre pages are stored as they were at the cutoff, so:
+      - topic rules (joke, media, creator docs, franchise, maps, novels, soundtrack) read the current categories:
+        a page's topic does not change, and cutoff-time categories over-drop ("Block states" carried a joke
+        category on 31 March 2025 from an April Fools section);
+      - the page-type rule (disambiguation) reads the cutoff revision's categories, and only for text under 1,500
+        characters (a link list): "Ocean Ruins" was a 14,000-character article at the cutoff and became a
+        disambiguation page in April 2026, while summary pages tagged disambiguation then (Metal, Golem) carry facts."""
+    if cutoff is None:
+        return classify((title, {"categories": current}), False)[1] or extra_reason(title, current, post=True)
+    topic = sorted(set(current) - {"Disambiguation_pages"})
+    reason = classify((title, {"categories": topic}), False)[1] or extra_reason(title, topic, post=False)
+    if not reason and "Disambiguation_pages" in cutoff and len(record.get("content") or "") < DISAMBIGUATION_MAX_CHARS:
+        reason = "disambiguation page at the cutoff"
+    return reason
+
+
+def lookup_categories(title: str, attempts: int = 6) -> List[str]:
+    """Current categories of a page not in the page list. Raises if every attempt fails: a failed lookup is
+    neither evidence of innocence (joke pages would get in) nor of guilt (Phantom and Explosion were dropped)."""
+    for i in range(attempts):
+        cats = get_page_categories(title)
+        if cats is not None:
+            return cats
+        time.sleep(10 * (i + 1))
+    raise WikiAPIError(f"category lookup failed for {title}")
+
+
+def cutoff_categories(oldid: str) -> List[str]:
+    """Categories of a stored revision."""
+    d = _api({"action": "parse", "oldid": oldid, "prop": "categories"})
+    if "parse" not in d:
+        raise WikiAPIError(f"no parse result for revision {oldid}")
+    return [c["*"] for c in d["parse"].get("categories", [])]
+
+
+def filter_corpus(path: str, label: str, dry_run: bool, workers: int, post: bool) -> List[str]:
+    """Filters one corpus JSON; returns the titles it dropped (or would drop). The unfiltered corpus is kept as
+    <path>.prefilter and is what a rerun filters, so changed rules apply to every page."""
+    backup = f"{path}.prefilter"
+    src = backup if os.path.exists(backup) else path
+    if not os.path.exists(src):
         print(f"[{label}] missing: {path}")
         return []
-
-    with open(path, "r", encoding="utf-8") as f:
+    with open(src, "r", encoding="utf-8") as f:
         data = json.load(f)
+    print(f"\n[{label}] {len(data)} pages in {src}")
 
-    print(f"\n[{label}] {len(data)} pages in {path}")
-    print(f"[{label}] fetching categories ({workers} workers)...")
-
+    listed = {}
+    if os.path.exists(PAGE_LIST_FILE):
+        listed = {_key(t): c for t, c in _load_page_list()["articles"].items()}
+    # A C_pre page missing from the list (an article at the cutoff, a redirect now) is judged on its cutoff
+    # categories; C_post pages, and every page when there is no list, are looked up.
+    lookups = [t for t in data if t not in listed and not title_reason(t) and (post or not listed)]
+    print(f"[{label}] categories: {len(data) - len(lookups)} from the page list, {len(lookups)} to look up")
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        results = list(ex.map(lambda it: classify(it, True), data.items()))
+        current = dict(zip(lookups, ex.map(lookup_categories, lookups)))
+    current.update({t: listed[t] for t in data if t in listed})
 
-    dropped: Dict[str, List[str]] = {}
+    cut = None
+    if not post:
+        cache_path = f"{path}.cutoff_categories.json"
+        cut = json.load(open(cache_path, encoding="utf-8")) if os.path.exists(cache_path) else {}
+        todo = [t for t in data if t not in cut and not (title_reason(t) or extra_reason(t, [], post=False))]
+        print(f"[{label}] cutoff-revision categories: {len(todo)} to fetch")
+        lock = threading.Lock()
+
+        def record(t, cats):
+            with lock:
+                cut[t] = cats
+
+        failing = _run_passes(todo, lambda t: cutoff_categories(data[t]["oldid"]), record, workers, 4,
+                              f"{label} categories")
+        _save_json(cut, cache_path)
+        if failing:
+            raise WikiAPIError(f"cutoff categories still failing for {len(failing)} pages; rerun the filter")
+
+    dropped: Dict[str, str] = {}
     kept: Dict[str, Any] = {}
-    for title, reason, cats in results:
-        rec = data[title]
-        if cats:
-            rec["categories"] = cats
+    for title, rec in data.items():
+        reason = (title_reason(title) or extra_reason(title, [], post)
+                  or page_reason(title, rec, current.get(title, (cut or {}).get(title, [])),
+                                 None if post else cut.get(title, [])))
         if reason:
-            dropped.setdefault(reason.split(" (")[0], []).append(title)
+            dropped[title] = reason
         else:
-            kept[title] = rec
+            kept[title] = {**rec, "categories": current[title] if post else cut[title]}
 
-    total_dropped = sum(len(v) for v in dropped.values())
-    print(f"[{label}] dropping {total_dropped}, keeping {len(kept)}")
-    for reason, titles in sorted(dropped.items(), key=lambda kv: -len(kv[1])):
+    by_reason: Dict[str, List[str]] = {}
+    for t, r in dropped.items():
+        by_reason.setdefault(r.split(" (")[0], []).append(t)
+    print(f"[{label}] dropping {len(dropped)}, keeping {len(kept)}")
+    for reason, titles in sorted(by_reason.items(), key=lambda kv: -len(kv[1])):
         print(f"    {reason}: {len(titles)}")
         for t in titles[:8]:
             print(f"        {t}")
         if len(titles) > 8:
             print(f"        ... and {len(titles)-8} more")
-
-    dropped_titles = [t for titles in dropped.values() for t in titles]
     if dry_run:
         print(f"[{label}] dry run, nothing written")
-        return dropped_titles
+        return list(dropped)
 
-    backup = f"{path}.prefilter"
     if not os.path.exists(backup):
         shutil.copy2(path, backup)
         print(f"[{label}] backup -> {backup}")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(kept, f, indent=2, ensure_ascii=False)
+    _save_json(kept, path)
+    _save_json(dropped, f"{path}.dropped.json")
     chars = sum(len(v.get("content") or "") for v in kept.values())
     print(f"[{label}] wrote {len(kept)} pages ({chars/1e6:.1f}M chars) -> {path}")
-    return dropped_titles
+    return list(dropped)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Scrape and filter the two corpora.")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = ap.add_subparsers(dest="cmd", required=True)
-    p = sp.add_parser("pre", help="crawl C_pre")
+    sp.add_parser("list", help="list every article (with categories) and recently edited redirect")
+    for name, help_ in (("pre", "C_pre from the page list"), ("post", "C_post from the page list")):
+        p = sp.add_parser(name, help=help_)
+        p.add_argument("--workers", type=int, default=8)
+        p.add_argument("--passes", type=int, default=4, help="retry passes for pages whose requests failed")
+    f = sp.add_parser("filter", help="filter both corpora in place (the unfiltered corpus is kept as .prefilter)")
+    f.add_argument("--dry-run", action="store_true")
+    f.add_argument("--workers", type=int, default=8)
+    p = sp.add_parser("crawl-pre", help="v13: link-following crawl of C_pre with a page cap")
     p.add_argument("--max-pages", type=int, default=4000)
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--seed-categories", action="store_true", help="also seed from gameplay categories")
     p.add_argument("--output", default=TRAIN_JSON_FILE)
-    q = sp.add_parser("post", help="crawl C_post")
+    q = sp.add_parser("crawl-post", help="v13: link-following crawl of C_post with a page cap")
     q.add_argument("--max-pages", type=int, default=300)
     q.add_argument("--workers", type=int, default=8)
     q.add_argument("--output", default=TEST_JSON_FILE)
-    f = sp.add_parser("filter", help="filter both corpora in place (a .prefilter backup is kept)")
-    f.add_argument("--dry-run", action="store_true")
-    f.add_argument("--workers", type=int, default=8)
     args = ap.parse_args()
 
-    if args.cmd == "pre":
+    failing: List[str] = []
+    if args.cmd == "list":
+        list_pages()
+    elif args.cmd == "pre":
+        failing = scrape_pre_full(workers=args.workers, passes=args.passes)
+    elif args.cmd == "post":
+        failing = scrape_post_full(workers=args.workers, passes=args.passes)
+    elif args.cmd == "filter":
+        filter_corpus(TRAIN_JSON_FILE, "C_pre", args.dry_run, args.workers, post=False)
+        filter_corpus(TEST_JSON_FILE, "C_post", args.dry_run, args.workers, post=True)
+    elif args.cmd == "crawl-pre":
         scrape_wiki_pre_cutoff(start_urls=START_PAGES, output_path=args.output, max_pages=args.max_pages,
                                concurrency=args.workers, seed=args.seed,
                                seed_categories=SEED_CATEGORIES if args.seed_categories else None)
-    elif args.cmd == "post":
-        scrape_wiki_post_cutoff(output_path=args.output, max_pages=args.max_pages, concurrency=args.workers)
     else:
-        filter_corpus(TRAIN_JSON_FILE, "C_pre", args.dry_run, args.workers)
-        filter_corpus(TEST_JSON_FILE, "C_post", args.dry_run, args.workers)
+        scrape_wiki_post_cutoff(output_path=args.output, max_pages=args.max_pages, concurrency=args.workers)
+    if failing:
+        raise SystemExit(f"{len(failing)} pages still failing (e.g. {failing[:5]}); rerun to retry them")
 
 
 if __name__ == "__main__":

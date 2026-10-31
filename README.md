@@ -7,9 +7,9 @@ one resumes if rerun.
 
 | Step | Script | What it does |
 |---|---|---|
-| 1 | `1_scrape.py` | Builds the two corpora from minecraft.wiki: **C_pre** (each page's newest revision at or before 31 March 2025) and **C_post** (pages first created after it), then filters out pages that are not real base-game mechanics |
+| 1 | `1_scrape.py` | Builds the two corpora from minecraft.wiki's complete page list: **C_pre** (each page's newest revision at or before 31 March 2025) and **C_post** (pages first created after it), then filters out pages that are not real base-game mechanics |
 | 2 | `2_index.py` | Chunks both corpora (1,500 characters, 250 overlap, `[Page: <title>]` prefix) and embeds them into ChromaDB |
-| 3 | `3_generate.py` | Scenario-first question generation, verification against C_pre, and assembly (700 answerable, 300 unanswerable) |
+| 3 | `3_generate.py` | Scenario-first question generation, verification against C_pre, automated checks of the unanswerable candidates, and assembly (700 answerable, 300 unanswerable) |
 | 4 | `4_reference_answers.py` | Reference answers from an oracle model given the source wiki pages |
 | 5 | `5_answer.py` | Runs a model on the benchmark: no retrieval, single-shot RAG or iterative RAG; thinking enabled or disabled |
 | 6 | `6_judge_responses.py` | Response judge: labels every response ABSTAIN, DENY or ANSWER |
@@ -22,10 +22,40 @@ Shared modules: `config.py` (settings and endpoints), `prompts.py` (every prompt
 
 ## Data
 
-The benchmark questions, reference answers, corpora snapshots and model responses will be available at:
-**TODO: data link**
+The benchmark (October 2026 build: C_pre and C_post corpora, their chunks, 1,000 questions and reference answers) is on
+the Hugging Face Hub: **https://huggingface.co/datasets/TODO-namespace/DeclineCraft** (CC BY-NC-SA 3.0). To use it with
+these scripts, write their input files from it (`pip install datasets`):
 
-The corpora can also be rebuilt from minecraft.wiki with `1_scrape.py` and `2_index.py` (steps 1-2 below).
+```python
+import json, os
+import pandas as pd
+from datasets import load_dataset
+
+REPO = "TODO-namespace/DeclineCraft"
+os.makedirs("data", exist_ok=True)
+for name in ("pre", "post"):                     # data/c_pre.json, data/c_post.json, in crawl order
+    pages = load_dataset(REPO, f"corpus_{name}", split="train")
+    json.dump({p["url"].split("/w/")[-1]: {"url": p["url"], "oldid": p["oldid"],
+                                           "date": p["revision_date"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                           "content": p["content"]} for p in pages},
+              open(f"data/c_{name}.json", "w", encoding="utf-8"), ensure_ascii=False)
+q = load_dataset(REPO, "questions", split="train").to_pandas()
+pd.DataFrame({"question": q.question, "source": q.source,
+              "scenario_chunks": q.scenario_chunk_ids.map(lambda x: str(list(x))),
+              "scenario_titles": q.scenario_titles.map(lambda x: str(list(x))),
+              "question_chunks": q.target_chunk_ids.map(lambda x: str(list(x))),
+              "question_titles": q.target_titles.map(lambda x: str(list(x))),
+              "target_fact": q.target_fact}).to_csv("questions.csv", index=False)
+r = load_dataset(REPO, "references", split="train").to_pandas()
+for half, src in (("answerable", "Pre-cutoff"), ("unanswerable", "latest")):
+    h = r[r.source == src]
+    pd.DataFrame({"question": h.question, "source": h.source, "answer": h.reference_answer, "answered": 1}).to_csv(
+        f"references_{half}.csv", index=False)
+```
+
+Then `python 2_index.py` builds the index (step 2 below); it reproduces the chunk ids the questions refer to. The
+corpora can also be rebuilt from minecraft.wiki with `1_scrape.py`, but C_post pages are scraped at their latest
+revision, so a new crawl can differ.
 
 ## Setup
 
@@ -57,29 +87,55 @@ settings are:
 ## Rebuilding the benchmark (steps 1-4)
 
 ```bash
-python 1_scrape.py pre --seed-categories          # C_pre -> data/c_pre.json
+python 1_scrape.py list                           # every article and recently edited redirect -> data/page_list.json
+python 1_scrape.py pre                            # C_pre -> data/c_pre.json
 python 1_scrape.py post                           # C_post -> data/c_post.json
 python 1_scrape.py filter                         # drop joke, version, story, media and non-article pages
 python 2_index.py                                 # data/chroma (C_pre and C_post collections)
 
-python 3_generate.py --stage generate --generator-url $URL --generator-model qwen3.5-122b-a10b
-python 3_generate.py --stage judge    --verifier-url  $URL --verifier-model  gemma-4-31b-it
-python 3_generate.py --stage assemble --out questions.csv
+python 3_generate.py --stage generate  --generator-url $URL --generator-model qwen3.5-122b-a10b
+python 3_generate.py --stage judge     --verifier-url  $URL --verifier-model  gemma-4-31b-it
+python 3_generate.py --stage factcheck --verifier-url  $URL --verifier-model  gemma-4-31b-it
+python 3_generate.py --stage screen    --screen-url    $URL --screen-model    qwen3.8-27b
+python 3_generate.py --stage assemble  --verifier-url  $URL --verifier-model  gemma-4-31b-it --out questions.csv
 
 python 4_reference_answers.py -i questions.csv -o references_answerable.csv
 python 4_reference_answers.py -i questions.csv -o references_unanswerable.csv --unanswerable-only
 ```
 
+- The corpora come from the wiki's complete page list (main and Tutorial namespaces), not from a link-following
+  crawl: the capped crawls used for the paper's v13 corpora (`crawl-pre`, `crawl-post`) missed about 900
+  articles that existed at the cutoff. A failed API request is retried and never read as "no revision" or "no
+  categories"; a stage exits non-zero while pages are still failing, and resumes when rerun.
+- The filter judges C_pre pages as they were at the cutoff where it matters: a page that was an article then and
+  is a disambiguation page now stays. Tutorials, set-index pages and planned features stay in C_pre but not in
+  C_post (post-cutoff tutorials are guides to old mechanics).
 - Generation runs with thinking disabled: temperature 0.3 for the scenario, 0.5 for the question, 0 otherwise.
-  The verifier runs at temperature 0 with thinking disabled. The generate and judge stages are separate, so a
-  server that serves one model at a time loads each model once.
+  The verifier and the checks run at temperature 0 with thinking disabled. Each stage is separate, so a server
+  that serves one model at a time loads each model once; every stage caches its verdicts per question.
+- Unanswerable candidates get three automated checks beyond verification, applied at assembly. They replace
+  the hand review of the paper's v13 set, where flagged questions were swapped for unused candidates:
+  - **factcheck**: the verifier, explaining before its verdict, confirms the target chunk supports every claim in
+    the fact. A fact that adds a comparison or a change ("unlike other ruins", "a change from 2 to 5") is old
+    information presented as new.
+  - **screen**: a judge from another model family reads the full C_pre pages behind the top retrieved chunks (up
+    to 24,000 characters) and says whether they state the fact. It catches facts in infoboxes and tables, and on
+    pages split out of older ones, that 12 retrieved chunks miss.
+  - **no C_post sub-pages**: a target page named "Parent/Child" (reference tables and documentation split out
+    of older pages) is not used.
+- Assembly also skips duplicate facts in both halves: a fact whose embedding cosine or word Jaccard with an
+  accepted fact is at least 0.85 goes to the verifier, which answers SAME or DIFFERENT (one changed number makes
+  two facts different). `--exclusions` takes an optional list of questions excluded by hand. `--cached-only`
+  re-assembles from the cached verdicts without any model call.
 - `questions.csv` has one row per question: `question` (scenario + question), `source` (`Pre-cutoff` =
-  answerable, `latest` = unanswerable), the chunk ids and titles of the scenario and target, and `target_fact`.
-- For the paper, every unanswerable question was also reviewed by hand against C_pre. Malformed ones (fake items
-  or mechanics) were replaced by unused candidates that had passed the same checks. That review is not
-  automated here.
+  answerable, `latest` = unanswerable), the chunk ids and titles of the scenario and target, `target_fact`, and
+  `target_chunk` (the target chunk's text). A rebuilt index renumbers its chunks; `4_reference_answers.py` refuses
+  chunk ids that no longer point at their recorded pages, and uses `target_chunk` for the target.
+- `questions_plus_reserve.csv` continues the same assembly past the targets (by 40 answerable and 100
+  unanswerable questions), as replacements.
 - The reference prompt mentions web search, but no search tool is given: the oracle answers from the full pages
-  the question was written from, plus the scenario's chunks. The paper uses DeepSeek V4.1 Flash via OpenRouter.
+  the question was written from, plus the scenario's chunks. The paper uses DeepSeek V4.1 Flash via OpenRouter;
+  `--provider` pins providers with no fallback, and `--service-tier` and `--timeout` suit slower, cheaper tiers.
 - C_pre is pinned by the cutoff date. C_post pages are stored at their latest revision when scraped, so a later
   crawl can differ.
 

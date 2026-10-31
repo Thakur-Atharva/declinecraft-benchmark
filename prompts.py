@@ -129,6 +129,47 @@ TOPIC_LINE = {
 }
 
 
+# --- Checks on verified candidates (3_generate.py --stage factcheck / screen / assemble) ------------
+# The full-page screen reuses FACT_VERIFY_PROMPT and ANSWER_DRIFT_PROMPT above, on whole C_pre pages.
+
+
+# Faithfulness: the target chunk supports every claim in the fact. Old information plus a claim the chunk does not
+# make ("a change from the previous range of 2 to 5") cannot be confirmed against C_pre and so passes as new.
+FAITHFUL_PROMPT = """A FACT was written from a PASSAGE of the Minecraft Wiki. Check whether the PASSAGE supports the FACT. The FACT may reword or summarise the PASSAGE, and calling something "new" is fine.
+The FACT is NOT supported if it adds a claim the PASSAGE does not make, for example a comparison with other things ("not found in other ...", "unlike ...", "only ...") or a claim that something changed ("a change from ...", "previously ...", "no longer ..."), or if the PASSAGE says something different.
+
+FACT: {fact}
+
+PASSAGE:
+{passage}
+
+Explain in one or two sentences, then give your verdict on the last line as "VERDICT: YES" (supported) or "VERDICT: NO" (not supported)."""
+
+
+# The verifier's C_pre question with an explanation first. Recorded, not applied: it over-flags new facts it reasons
+# are implied by older ones.
+CPRE_EXPLAINED_PROMPT = """Does the CONTEXT (older Minecraft Wiki text) state or directly imply the following FACT? A reader of the CONTEXT knows the FACT if the CONTEXT gives the same information, even worded differently.
+
+FACT: {fact}
+
+CONTEXT:
+{context}
+
+Explain in one or two sentences, then give your verdict on the last line as "VERDICT: YES" (the CONTEXT states or directly implies the FACT) or "VERDICT: NO"."""
+
+
+# Duplicate facts: asked for pairs of target facts with embedding cosine >= 0.85 or word Jaccard >= 0.85.
+SAME_FACT_PROMPT = """Two statements about Minecraft are given. Decide whether they state the SAME fact.
+
+SAME: both make the same core claim about the same thing (same item, block, mob, place, edition and values). Rewording does not matter, and neither does one statement adding a minor detail to the same claim.
+DIFFERENT: they are about a different thing (another item, mob, material, place or edition), give a different value or number, make opposite claims, or describe different properties of the same thing.
+
+A: {a}
+B: {b}
+
+Answer with one word: SAME or DIFFERENT."""
+
+
 # --- Answering (5_answer.py) ------------------------------------------------------------------------
 
 

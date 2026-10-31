@@ -88,12 +88,34 @@ def _ids(row, column):
         return []
 
 
-def _chunk_block(coll, ids):
+def _chunk_block(coll, ids, titles=None):
+    """Chunks by id, each with its title and URL. With titles (the question file's own record), every chunk must
+    come from the page it was recorded with: a rebuilt index renumbers its chunks, and stale ids would hand the
+    oracle other pages without any error."""
     if not ids:
         return []
     res = coll.get(ids=ids, include=["documents", "metadatas"])
+    got = dict(zip(res["ids"], zip(res["documents"], res["metadatas"])))
+    if titles is not None:
+        stale = [i for i, t in zip(ids, titles) if i not in got or got[i][1].get("title") != t]
+        if stale or len(ids) != len(titles):
+            raise SystemExit(f"chunk ids {ids} no longer match their recorded pages {titles}: the index was rebuilt "
+                             f"after the questions were written")
     return [f"Title: {m.get('title')}\nSource URL: {m.get('source_url')}\n\n {d}"
-            for d, m in zip(res["documents"], res["metadatas"])]
+            for d, m in (got[i] for i in ids if i in got)]
+
+
+def _premise_block(row, coll, premise_titles):
+    """The target chunk. When the question file stores its text (target_chunk) and the id no longer holds that
+    text, the stored text is used: the question stays tied to its source across a re-index."""
+    ids = _ids(row, "question_chunks")
+    target = row.get("target_chunk")
+    if not (isinstance(target, str) and target.strip() and premise_titles):
+        return _chunk_block(coll, ids, premise_titles)
+    res = coll.get(ids=ids, include=["documents"]) if ids else {"ids": [], "documents": []}
+    if res["ids"] == ids and res["documents"] == [target]:
+        return _chunk_block(coll, ids)
+    return [f"Title: {premise_titles[0]}\n\n {target}"]
 
 
 def build_prompt(row, train_coll, test_coll, mode="premise", pages=None, structured=False) -> str:
@@ -105,26 +127,34 @@ def build_prompt(row, train_coll, test_coll, mode="premise", pages=None, structu
       chunks   those plus the chunks the scenario was written from
       pages    the premise pages in full, plus the scenario chunks -- so the oracle can
                see a qualifier in another section, or that the premise is unsupported
+
+    Question files from 3_generate.py carry the target chunk's text and page title (target_chunk,
+    question_titles), which are used when present; chunk ids are checked against the recorded titles.
     """
     coll = test_coll if row["source"] == "latest" else train_coll
-    blocks = _chunk_block(coll, _ids(row, "question_chunks"))
+    premise_titles = _ids(row, "question_titles") or None
+    scenario_titles = _ids(row, "scenario_titles") or None
+    blocks = _premise_block(row, coll, premise_titles)
 
     if mode in ("chunks", "pages"):
-        blocks += _chunk_block(train_coll, _ids(row, "scenario_chunks"))
+        blocks += _chunk_block(train_coll, _ids(row, "scenario_chunks"), scenario_titles)
     if mode == "pages":
-        # The pages the premise chunks came from, read off the chunks' own metadata and
-        # de-duplicated: three chunks from two pages give those two pages once each.
-        # Taken from the collection the question belongs to, because the two collections
-        # reuse the same chunk ids (all 712 C_post ids also exist in C_pre).
+        # The pages the premise chunks came from, de-duplicated: three chunks from two pages give those two pages
+        # once each. Read off the question file's titles when it has them, else off the chunks' own metadata, taken
+        # from the collection the question belongs to, because the two collections reuse the same chunk ids (all
+        # 712 C_post ids also exist in C_pre).
         titles, seen = [], set()
         premise = _ids(row, "question_chunks")
-        if premise:
-            got = coll.get(ids=premise, include=["metadatas"])
-            for m in got["metadatas"]:
-                title = m.get("title")
-                if title and title not in seen:
-                    seen.add(title)
-                    titles.append(title)
+        if premise_titles:
+            candidates = premise_titles
+        elif premise:
+            candidates = [m.get("title") for m in coll.get(ids=premise, include=["metadatas"])["metadatas"]]
+        else:
+            candidates = []
+        for title in candidates:
+            if title and title not in seen:
+                seen.add(title)
+                titles.append(title)
         full = []
         for title in titles:
             page = (pages or {}).get(row["source"], {}).get(title) or (pages or {}).get("Pre-cutoff", {}).get(title)
@@ -132,7 +162,7 @@ def build_prompt(row, train_coll, test_coll, mode="premise", pages=None, structu
                 full.append(f"Title: {title}\nSource URL: {page.get('url')}\n"
                             f"Revision: {page.get('oldid')} ({page.get('date')})\n\n{page['content']}")
         # The full pages replace the premise chunks they contain; the scenario chunks stay.
-        blocks = full + _chunk_block(train_coll, _ids(row, "scenario_chunks")) if full else blocks
+        blocks = full + _chunk_block(train_coll, _ids(row, "scenario_chunks"), scenario_titles) if full else blocks
 
     context = "\n---\n".join(blocks) or "No context retrieved."
     system = REFERENCE_PROMPT_UNANSWERABLE if row["source"] == "latest" else REFERENCE_PROMPT
@@ -166,7 +196,10 @@ def answer_row(client, row, args, colls) -> dict:
            "refusal_eval": "heuristic", "model": args.model, "answer": "", "answered": 0, "cost": 0.0}
     body = {"usage": {"include": True}}
     if args.provider:
-        body["provider"] = {"only": args.provider.split(",")}
+        # Pinned: no silent fallback to a provider outside the list (another quantisation or price).
+        body["provider"] = {"only": args.provider.split(","), "allow_fallbacks": False}
+    if args.service_tier:
+        body["service_tier"] = args.service_tier
     prompt = build_prompt(row, *colls, mode=args.context, pages=args.pages)
     out["context_mode"], out["context_chars"] = args.context, len(prompt)
     for attempt in range(1, args.retries + 1):
@@ -196,7 +229,9 @@ def main():
     p.add_argument("-o", "--output", required=True)
     p.add_argument("--model", default="deepseek/deepseek-v4.1-flash")
     p.add_argument("--url", default=OPENROUTER_BASE_URL)
-    p.add_argument("--provider", default="", help="comma-separated OpenRouter provider slugs")
+    p.add_argument("--provider", default="", help="comma-separated OpenRouter provider slugs (no fallback)")
+    p.add_argument("--service-tier", default="", help="provider service tier, e.g. flex (discounted, slower)")
+    p.add_argument("--timeout", type=float, default=300, help="seconds per request; raise it for slow tiers")
     p.add_argument("--context", choices=["premise", "chunks", "pages"], default="pages")
     p.add_argument("--unanswerable-only", action="store_true", help="answer the post-cutoff questions instead")
     p.add_argument("--workers", type=int, default=12)
@@ -213,7 +248,7 @@ def main():
     print(f"{len(questions)} questions | {len(questions) - len(pending)} already answered | {len(pending)} to run")
     if pending.empty:
         return
-    client = make_client(args.url, timeout=300)
+    client = make_client(args.url, timeout=args.timeout)
     colls = load_collections()
     args.pages = load_pages() if args.context == "pages" else None
     lock = threading.Lock()
