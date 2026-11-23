@@ -104,7 +104,7 @@ python 4_reference_answers.py -i questions.csv -o references_unanswerable.csv --
 ```
 
 - The corpora come from the wiki's complete page list (main and Tutorial namespaces), not from a link-following
-  crawl: the capped crawls used for the paper's v13 corpora (`crawl-pre`, `crawl-post`) missed about 900
+  crawl: the capped crawls used for the paper's corpora (`crawl-pre`, `crawl-post`) missed about 900
   articles that existed at the cutoff. A failed API request is retried and never read as "no revision" or "no
   categories"; a stage exits non-zero while pages are still failing, and resumes when rerun.
 - The filter judges C_pre pages as they were at the cutoff where it matters: a page that was an article then and
@@ -114,7 +114,7 @@ python 4_reference_answers.py -i questions.csv -o references_unanswerable.csv --
   The verifier and the checks run at temperature 0 with thinking disabled. Each stage is separate, so a server
   that serves one model at a time loads each model once; every stage caches its verdicts per question.
 - Unanswerable candidates get three automated checks beyond verification, applied at assembly. They replace
-  the hand review of the paper's v13 set, where flagged questions were swapped for unused candidates:
+  the hand review of the paper's question set, where flagged questions were swapped for unused candidates:
   - **factcheck**: the verifier, explaining before its verdict, confirms the target chunk supports every claim in
     the fact. A fact that adds a comparison or a change ("unlike other ruins", "a change from 2 to 5") is old
     information presented as new.

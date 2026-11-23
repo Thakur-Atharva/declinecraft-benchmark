@@ -24,7 +24,7 @@ resumes if rerun, and exits non-zero while pages are still failing.
     python 1_scrape.py post
     python 1_scrape.py filter
 
-The paper's v13 corpora were built by link-following crawls with page caps, which missed about 900 articles that
+The paper's corpora were built by link-following crawls with page caps, which missed about 900 articles that
 existed at the cutoff; they are kept as `crawl-pre` and `crawl-post`.
 """
 import argparse
@@ -1234,13 +1234,13 @@ def main():
     f = sp.add_parser("filter", help="filter both corpora in place (the unfiltered corpus is kept as .prefilter)")
     f.add_argument("--dry-run", action="store_true")
     f.add_argument("--workers", type=int, default=8)
-    p = sp.add_parser("crawl-pre", help="v13: link-following crawl of C_pre with a page cap")
+    p = sp.add_parser("crawl-pre", help="the paper's link-following crawl of C_pre with a page cap")
     p.add_argument("--max-pages", type=int, default=4000)
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--seed-categories", action="store_true", help="also seed from gameplay categories")
     p.add_argument("--output", default=TRAIN_JSON_FILE)
-    q = sp.add_parser("crawl-post", help="v13: link-following crawl of C_post with a page cap")
+    q = sp.add_parser("crawl-post", help="the paper's link-following crawl of C_post with a page cap")
     q.add_argument("--max-pages", type=int, default=300)
     q.add_argument("--workers", type=int, default=8)
     q.add_argument("--output", default=TEST_JSON_FILE)
