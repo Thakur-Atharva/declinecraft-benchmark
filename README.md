@@ -23,7 +23,7 @@ Shared modules: `config.py` (settings and endpoints), `prompts.py` (every prompt
 ## Data
 
 The benchmark (October 2026 build: C_pre and C_post corpora, their chunks, 1,000 questions and reference answers) is on
-the Hugging Face Hub: **https://huggingface.co/datasets/TODO-namespace/DeclineCraft** (CC BY-NC-SA 3.0). To use it with
+the Hugging Face Hub: **https://huggingface.co/datasets/AtharvaT/DeclineCraft** (CC BY-NC-SA 3.0). To use it with
 these scripts, write their input files from it (`pip install datasets`):
 
 ```python
@@ -31,7 +31,7 @@ import json, os
 import pandas as pd
 from datasets import load_dataset
 
-REPO = "TODO-namespace/DeclineCraft"
+REPO = "AtharvaT/DeclineCraft"
 os.makedirs("data", exist_ok=True)
 for name in ("pre", "post"):                     # data/c_pre.json, data/c_post.json, in crawl order
     pages = load_dataset(REPO, f"corpus_{name}", split="train")
